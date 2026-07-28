@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-奶龙动图资源包生成器
+动图资源包生成器
 把一个文件夹里的 GIF 表情包一键转换成 Minecraft Java 版动态贴图资源包（ZIP）。
 核心流程：GIF -> 逐帧合成正方形竖长图 + 按真实帧时长生成 .mcmeta -> 随机替换原版方块/物品贴图 -> 打包 ZIP + 替换报告。
 """
 
 import csv
+import fnmatch
 import hashlib
 import json
 import os
@@ -50,13 +51,12 @@ COMMON_BLOCKS = [
     "deepslate", "cobbled_deepslate", "deepslate_bricks", "deepslate_tiles",
     "granite", "diorite", "andesite", "polished_granite", "polished_diorite", "polished_andesite",
     "dirt", "coarse_dirt", "rooted_dirt", "mud", "podzol_top", "podzol_side",
-    "grass_block_top", "grass_block_side", "dirt_path_top", "dirt_path_side",
+    "dirt_path_top", "dirt_path_side",
     "sand", "red_sand", "gravel", "clay", "sandstone", "sandstone_top", "sandstone_bottom",
     "red_sandstone", "red_sandstone_top",
     "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks",
     "dark_oak_planks", "mangrove_planks", "cherry_planks", "bamboo_planks", "crimson_planks", "warped_planks",
     "oak_log", "oak_log_top", "spruce_log", "birch_log", "jungle_log", "acacia_log", "dark_oak_log",
-    "oak_leaves", "spruce_leaves", "birch_leaves", "jungle_leaves", "azalea_leaves",
     "bricks", "mud_bricks", "packed_mud",
     "white_wool", "orange_wool", "magenta_wool", "light_blue_wool", "yellow_wool", "lime_wool",
     "pink_wool", "gray_wool", "light_gray_wool", "cyan_wool", "purple_wool", "blue_wool",
@@ -93,11 +93,30 @@ COMMON_BLOCKS = [
     "loom_side", "cartography_table_top", "fletching_table_front", "smithing_table_front",
 ]
 
+# 会被游戏染色（变绿/变蓝）或有特殊机制的贴图，全量替换模式下自动跳过
+EXCLUDE_BLOCK = [
+    "water_*", "lava_*", "fire_*", "soul_fire_*", "*_leaves", "leaves_*",
+    "destroy_stage_*", "debug*", "*_overlay", "redstone_dust_*",
+    "melon_stem*", "pumpkin_stem*", "attached_*_stem", "grass_block_top", "short_grass", "tall_grass*",
+    "fern*", "large_fern*", "vine*", "lily_pad", "sugar_cane",
+    "seagrass*", "kelp*", "birch_leaves*", "spruce_leaves*",
+]
+EXCLUDE_ITEM = [
+    "*_spawn_egg*", "leather_*", "potion*", "splash_potion*", "lingering_potion*",
+    "tipped_arrow*", "clock*", "compass*", "recovery_compass*", "filled_map*",
+    "firework_star*",
+]
+
+
+def _excluded(name, patterns):
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
 DEFAULT_CONFIG = {
     "gif_dir": str((TOOL_DIR.parent / "素材")),
     "out_dir": str((TOOL_DIR.parent / "输出")),
-    "pack_name": "我是奶龙资源包",
-    "description": "§e奶龙动态表情包 §7一键生成",
+    "pack_name": "我的动图资源包",
+    "description": "§e动态表情包资源包 §7一键生成",
     "mc_version": "1.21.9 - 1.21.10",
     "resolution": 128,
     "scope": "常见方块",
@@ -181,10 +200,12 @@ def generate_pack(cfg, log, progress):
     if scope == "常见方块":
         avail = set(data["block"])
         targets = [("block", n) for n in COMMON_BLOCKS if n in avail]
-    elif scope == "全部方块":
-        targets = [("block", n) for n in data["block"]]
-    else:  # 方块+物品
-        targets = [("block", n) for n in data["block"]] + [("item", n) for n in data["item"]]
+    else:
+        blocks = [("block", n) for n in data["block"] if not _excluded(n, EXCLUDE_BLOCK)]
+        if scope == "全部方块":
+            targets = blocks
+        else:  # 方块+物品
+            targets = blocks + [("item", n) for n in data["item"] if not _excluded(n, EXCLUDE_ITEM)]
 
     rng = random.Random(cfg["seed"] or None)
     rng.shuffle(targets)
@@ -278,7 +299,7 @@ def generate_pack(cfg, log, progress):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("奶龙动图资源包生成器")
+        root.title("动图资源包生成器")
         root.geometry("640x560")
         root.minsize(560, 500)
 
