@@ -236,20 +236,23 @@ def generate_pack(cfg, log, progress):
     done_count = 0
     fail = 0
 
+    import io
     for (kind, tex_name), gif_path in mapping:
         try:
-            key = hashlib.md5(gif_path.read_bytes()).hexdigest()
-            if key not in cache:
+            # 相同 GIF 只转换+编码一次，缓存 PNG 字节直接写盘，避免上千次重复编码
+            if gif_path not in cache:
                 frames, ticks = extract_frames(gif_path, size, alpha_fill, max_frames)
-                cache[key] = (build_strip(frames), build_mcmeta(ticks), len(frames))
-            strip, mcmeta, nframes = cache[key]
+                buf = io.BytesIO()
+                build_strip(frames).save(buf, "PNG", optimize=True)
+                cache[gif_path] = (buf.getvalue(), json.dumps(build_mcmeta(ticks)), len(frames))
+            png_bytes, mcmeta_str, nframes = cache[gif_path]
 
             dest_dir = tex_root / kind
             dest_dir.mkdir(parents=True, exist_ok=True)
             png_path = dest_dir / f"{tex_name}.png"
-            strip.save(png_path, "PNG", optimize=True)
+            png_path.write_bytes(png_bytes)
             (dest_dir / f"{tex_name}.png.mcmeta").write_text(
-                json.dumps(mcmeta), encoding="utf-8")
+                mcmeta_str, encoding="utf-8")
             report.append([kind, tex_name, gif_path.name, nframes])
         except Exception as e:
             fail += 1
@@ -277,11 +280,11 @@ def generate_pack(cfg, log, progress):
         w.writerow(["类型", "被替换贴图", "表情包文件", "帧数"])
         w.writerows(report)
 
-    # 打 ZIP
+    # 打 ZIP：PNG 本身已压缩，再用 DEFLATED 几乎压不出体积却极慢，故用 STORED 直接存
     zip_path = out_dir / f"{pack_name}.zip"
     if zip_path.exists():
         zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
         for p in pack_dir.rglob("*"):
             if p.is_file():
                 zf.write(p, p.relative_to(pack_dir))
