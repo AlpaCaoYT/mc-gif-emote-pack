@@ -13,12 +13,14 @@ import random
 import shutil
 import sys
 import threading
+import time
 import traceback
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageSequence
+    from PIL import Image, ImageSequence, ImageDraw, ImageFont
 except ImportError:
     import tkinter.messagebox as _mb
     _mb.showerror("缺少依赖", "未安装 Pillow 图像库。\n请运行：python -m pip install pillow")
@@ -123,6 +125,8 @@ DEFAULT_CONFIG = {
     "seed": "奶龙",
     "max_frames": 100,
     "strategy": "全随机",
+    "exclude_rules": "",
+    "incremental": False,
 }
 
 
@@ -180,9 +184,35 @@ def build_mcmeta(ticks):
     return {"animation": anim}
 
 
+def make_preview(samples, out_path, cell=128, cols=6):
+    """把采样到的若干方块+表情拼成一张缩略图（非游戏内实拍，仅看观感/分布）。"""
+    if not samples:
+        return
+    rows = (len(samples) + cols - 1) // cols
+    img = Image.new("RGB", (cols * cell, rows * cell), (28, 28, 32))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    for idx, (tex_name, gif_path) in enumerate(samples):
+        r, c = divmod(idx, cols)
+        x, y = c * cell, r * cell
+        try:
+            im = Image.open(gif_path).convert("RGBA")
+            im = im.resize((cell, cell), Image.LANCZOS)
+            img.paste(im, (x, y))
+        except Exception:
+            pass
+        if font:
+            draw.text((x + 3, y + cell - 14), tex_name[:16], fill=(240, 240, 240), font=font)
+    img.save(out_path, "PNG")
+
+
 # ---------------- 生成主流程 ----------------
 
 def generate_pack(cfg, log, progress):
+    import io
     gif_dir = Path(cfg["gif_dir"])
     out_dir = Path(cfg["out_dir"])
     pack_name = cfg["pack_name"].strip() or "动图资源包"
@@ -195,10 +225,14 @@ def generate_pack(cfg, log, progress):
         max_frames = size_limit
     alpha_fill = cfg["alpha_mode"] == "填白色底"
     pack_format = PACK_FORMATS[cfg["mc_version"]]
+    incremental = bool(cfg.get("incremental"))
+    # 自定义排除规则（逗号或换行分隔，支持 * 通配）
+    custom_excl = [p.strip() for p in str(cfg.get("exclude_rules", "")).replace("\n", ",").split(",") if p.strip()]
 
-    gifs = sorted(set(gif_dir.rglob("*.gif")) | set(gif_dir.rglob("*.png")))
+    # 同时支持 GIF / 普通PNG(静态贴图) / WebP 动图
+    gifs = sorted(set(gif_dir.rglob("*.gif")) | set(gif_dir.rglob("*.png")) | set(gif_dir.rglob("*.webp")))
     if not gifs:
-        raise ValueError(f"素材文件夹里没有 GIF：{gif_dir}")
+        raise ValueError(f"素材文件夹里没有可用图片（GIF/PNG/WebP）：{gif_dir}")
 
     # 游戏版本可对应不同方块清单模板；目前内置 1.21.10 一套，其他版本自动回退到它
     VERSION_TEXTURE_MAP = {
@@ -209,37 +243,93 @@ def generate_pack(cfg, log, progress):
         list_file = TEXTURE_LIST_FILE
     data = json.loads(list_file.read_text(encoding="utf-8-sig"))
     scope = cfg["scope"]
+    excl_b = EXCLUDE_BLOCK + custom_excl
+    excl_i = EXCLUDE_ITEM + custom_excl
     if scope == "常见方块":
         avail = set(data["block"])
-        targets = [("block", n) for n in COMMON_BLOCKS if n in avail]
+        targets = [("block", n) for n in COMMON_BLOCKS if n in avail and not _excluded(n, custom_excl)]
     else:
-        blocks = [("block", n) for n in data["block"] if not _excluded(n, EXCLUDE_BLOCK)]
+        blocks = [("block", n) for n in data["block"] if not _excluded(n, excl_b)]
         if scope == "全部方块":
             targets = blocks
         else:  # 方块+物品
-            targets = blocks + [("item", n) for n in data["item"] if not _excluded(n, EXCLUDE_ITEM)]
+            targets = blocks + [("item", n) for n in data["item"] if not _excluded(n, excl_i)]
 
     rng = random.Random(cfg["seed"] or None)
     gif_pool = gifs[:]
     rng.shuffle(gif_pool)
 
-    # “优先常见方块用不同表情”：常见方块先各自拿到不同表情，其余格子再循环复用
-    if cfg.get("strategy") == "优先常见方块用不同表情" and scope != "全部方块":
-        common_set = set(COMMON_BLOCKS)
-        is_common = lambda t: t[0] == "block" and t[1] in common_set
-        common_ts = [t for t in targets if is_common(t)]
-        rest_ts = [t for t in targets if not is_common(t)]
-        mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(common_ts)]
-        mapping += [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(rest_ts)]
+    # 增量更新：沿用上次分配（scope+分辨率一致时），把新增表情注入到“重复占用”的方块上
+    prev_map = {}
+    prev_pack = None
+    if incremental:
+        mfile = out_dir / f"{pack_name}_mapping.json"
+        if mfile.exists():
+            try:
+                prev = json.loads(mfile.read_text(encoding="utf-8"))
+                if prev.get("scope") == scope and prev.get("resolution") == size:
+                    for kind, tex_name, rel in prev["mapping"]:
+                        p = gif_dir / rel
+                        if p.exists():
+                            prev_map[(kind, tex_name)] = p
+            except Exception:
+                prev_map = {}
+        cand = out_dir / pack_name
+        if prev_map and cand.exists():
+            prev_pack = cand
+
+    if prev_map:
+        mapping = {}
+        for t in targets:
+            if t in prev_map and prev_map[t] in set(gif_pool):
+                mapping[t] = prev_map[t]
+        used = set(mapping.values())
+        new_emojis = [e for e in gif_pool if e not in used]
+        cnt = Counter(mapping.values())
+        dup_ts = [t for t in targets if t in mapping and cnt[mapping[t]] > 1]
+        for i, t in enumerate(dup_ts):
+            if i < len(new_emojis):
+                mapping[t] = new_emojis[i]
+        missing = [t for t in targets if t not in mapping]
+        fill = new_emojis + [e for e in gif_pool if e not in set(new_emojis)]
+        for i, t in enumerate(missing):
+            mapping[t] = fill[i % len(fill)] if fill else gif_pool[0]
+        mapping = list(mapping.items())
+        log(f"增量更新：沿用上次 {len(mapping) - len(missing)} 个分配，注入新表情 {min(len(new_emojis), len(dup_ts))} 个")
     else:
-        # 全随机：目标打乱后依次分配；素材多于目标只用一部分，目标多于素材则循环复用
-        rng.shuffle(targets)
-        if len(targets) <= len(gif_pool):
-            mapping = list(zip(targets, gif_pool[:len(targets)]))
+        if incremental:
+            log("未找到上次分配记录，改为全量生成")
+        # “优先常见方块用不同表情”：常见方块先各自拿到不同表情，其余格子再循环复用
+        if cfg.get("strategy") == "优先常见方块用不同表情" and scope != "全部方块":
+            common_set = set(COMMON_BLOCKS)
+            is_common = lambda t: t[0] == "block" and t[1] in common_set
+            common_ts = [t for t in targets if is_common(t)]
+            rest_ts = [t for t in targets if not is_common(t)]
+            mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(common_ts)]
+            mapping += [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(rest_ts)]
         else:
-            mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(targets)]
+            # 全随机：目标打乱后依次分配；素材多于目标只用一部分，目标多于素材则循环复用
+            rng.shuffle(targets)
+            if len(targets) <= len(gif_pool):
+                mapping = list(zip(targets, gif_pool[:len(targets)]))
+            else:
+                mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(targets)]
 
     pack_dir = out_dir / pack_name
+    # 增量模式下先把可复用的旧 PNG 读进内存，再清空重建，保证不残留失效贴图
+    reuse_bytes = {}
+    if prev_pack:
+        for (kind, tex_name), gif_path in mapping:
+            if prev_map.get((kind, tex_name)) == gif_path:
+                old_png = prev_pack / "assets" / "minecraft" / "textures" / kind / f"{tex_name}.png"
+                if old_png.exists():
+                    with Image.open(old_png) as im:
+                        nframes = im.height // im.width
+                    reuse_bytes[(kind, tex_name)] = (
+                        old_png.read_bytes(),
+                        (old_png.parent / f"{tex_name}.png.mcmeta").read_text(encoding="utf-8"),
+                        nframes,
+                    )
     if pack_dir.exists():
         shutil.rmtree(pack_dir)
     tex_root = pack_dir / "assets" / "minecraft" / "textures"
@@ -250,38 +340,50 @@ def generate_pack(cfg, log, progress):
         {"pack": {"pack_format": pack_format, "description": cfg["description"]}},
         ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 相同 GIF 只转换一次（按文件内容去重）
+    # 相同 GIF 只转换一次（按文件路径去重）
     cache = {}
     report = []
+    failures = []
     total = len(mapping)
     done_count = 0
     fail = 0
+    start = time.time()
+    samples = []  # 用于生成效果预览图
 
-    import io
     for (kind, tex_name), gif_path in mapping:
         try:
-            # 相同 GIF 只转换+编码一次，缓存 PNG 字节直接写盘，避免上千次重复编码
-            if gif_path not in cache:
-                frames, ticks = extract_frames(gif_path, size, alpha_fill, max_frames)
-                buf = io.BytesIO()
-                build_strip(frames).save(buf, "PNG", optimize=True)
-                cache[gif_path] = (buf.getvalue(), json.dumps(build_mcmeta(ticks)), len(frames))
-            png_bytes, mcmeta_str, nframes = cache[gif_path]
-
-            dest_dir = tex_root / kind
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            png_path = dest_dir / f"{tex_name}.png"
-            png_path.write_bytes(png_bytes)
-            (dest_dir / f"{tex_name}.png.mcmeta").write_text(
-                mcmeta_str, encoding="utf-8")
-            report.append([kind, tex_name, gif_path.name, nframes])
+            if (kind, tex_name) in reuse_bytes:
+                png_bytes, mcmeta_str, nframes = reuse_bytes[(kind, tex_name)]
+                dest_dir = tex_root / kind
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                (dest_dir / f"{tex_name}.png").write_bytes(png_bytes)
+                (dest_dir / f"{tex_name}.png.mcmeta").write_text(mcmeta_str, encoding="utf-8")
+                report.append([kind, tex_name, gif_path.name, nframes])
+            else:
+                if gif_path not in cache:
+                    frames, ticks = extract_frames(gif_path, size, alpha_fill, max_frames)
+                    buf = io.BytesIO()
+                    build_strip(frames).save(buf, "PNG", optimize=True)
+                    cache[gif_path] = (buf.getvalue(), json.dumps(build_mcmeta(ticks)), len(frames))
+                png_bytes, mcmeta_str, nframes = cache[gif_path]
+                dest_dir = tex_root / kind
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                png_path = dest_dir / f"{tex_name}.png"
+                png_path.write_bytes(png_bytes)
+                (dest_dir / f"{tex_name}.png.mcmeta").write_text(mcmeta_str, encoding="utf-8")
+                report.append([kind, tex_name, gif_path.name, nframes])
+                if len(samples) < 48:
+                    samples.append((tex_name, gif_path))
         except Exception as e:
             fail += 1
+            failures.append((kind, tex_name, gif_path.name, str(e)))
             log(f"  跳过 {gif_path.name} -> {tex_name}: {e}")
         done_count += 1
         if done_count % 10 == 0 or done_count == total:
             progress(done_count, total)
-            log(f"进度 {done_count}/{total}")
+            elapsed = time.time() - start
+            eta = (elapsed / done_count) * (total - done_count) if done_count else 0
+            log(f"进度 {done_count}/{total}  预计剩余 {int(eta)} 秒")
 
     # pack.png：随机拿一张 GIF 首帧当图标
     try:
@@ -300,6 +402,31 @@ def generate_pack(cfg, log, progress):
         w = csv.writer(f)
         w.writerow(["类型", "被替换贴图", "表情包文件", "帧数"])
         w.writerows(report)
+
+    # 失败清单
+    if failures:
+        fail_path = out_dir / f"{pack_name}_失败清单.txt"
+        with open(fail_path, "w", encoding="utf-8") as f:
+            f.write("以下贴图生成失败：\n")
+            for kind, tex_name, fname, err in failures:
+                f.write(f"[{kind}] {tex_name}  <- {fname}：{err}\n")
+        log(f"失败 {fail} 张，清单见：{fail_path}")
+
+    # 分配记录（供增量更新复用）
+    manifest = {
+        "scope": scope, "resolution": size, "max_frames": max_frames,
+        "mapping": [[k, n, str(p.relative_to(gif_dir))] for (k, n), p in mapping],
+    }
+    (out_dir / f"{pack_name}_mapping.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    # 效果预览图（采样若干方块，非游戏内实拍）
+    preview_path = out_dir / f"{pack_name}_预览图.png"
+    try:
+        make_preview(samples, preview_path)
+        log(f"预览图：{preview_path}")
+    except Exception as e:
+        log(f"预览图生成跳过：{e}")
 
     # 打 ZIP：PNG 本身已压缩，再用 DEFLATED 几乎压不出体积却极慢，故用 STORED 直接存
     zip_path = out_dir / f"{pack_name}.zip"
@@ -324,8 +451,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("动图资源包生成器")
-        root.geometry("640x560")
-        root.minsize(560, 500)
+        root.geometry("640x700")
+        root.minsize(560, 640)
 
         cfg = dict(DEFAULT_CONFIG)
         if CONFIG_FILE.exists():
@@ -380,6 +507,21 @@ class App:
         add_entry("随机种子（相同种子结果一致）", "seed")
         add_entry("单张GIF最大帧数", "max_frames")
 
+        ttk.Label(frm, text="自定义排除规则(每行/逗号一个,*通配)").grid(
+            row=row, column=0, sticky="w", pady=3)
+        ev = tk.StringVar(value=str(cfg.get("exclude_rules", "")))
+        self.excl_text = tk.Text(frm, height=2, wrap="word")
+        self.excl_text.insert("1.0", ev.get())
+        self.excl_text.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        self.vars["exclude_rules"] = ev
+        row += 1
+
+        iv = tk.BooleanVar(value=bool(cfg.get("incremental", False)))
+        self.vars["incremental"] = iv
+        ttk.Checkbutton(frm, text="增量更新（沿用上次分配，只把新表情加进去）",
+                        variable=iv).grid(row=row, column=0, columnspan=3, sticky="w", pady=3)
+        row += 1
+
         self.btn = ttk.Button(frm, text="一键生成资源包", command=self.start)
         self.btn.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 4))
         row += 1
@@ -413,7 +555,10 @@ class App:
         self.root.after(0, lambda: self.pbar.configure(value=done / total * 100))
 
     def get_cfg(self):
-        return {k: v.get() for k, v in self.vars.items()}
+        cfg = {k: v.get() for k, v in self.vars.items()}
+        if hasattr(self, "excl_text"):
+            cfg["exclude_rules"] = self.excl_text.get("1.0", "end").strip()
+        return cfg
 
     def start(self):
         cfg = self.get_cfg()
