@@ -116,7 +116,7 @@ DEFAULT_CONFIG = {
     "gif_dir": str((TOOL_DIR.parent / "素材")),
     "out_dir": str((TOOL_DIR.parent / "输出")),
     "pack_name": "我的动图资源包",
-    "description": "§e动态表情包资源包 §7一键生成",
+    "description": "动态表情包资源包 一键生成",
     "mc_version": "1.21.9 - 1.21.10",
     "resolution": 128,
     "scope": "常见方块",
