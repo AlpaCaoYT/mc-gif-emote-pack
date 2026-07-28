@@ -425,4 +425,5 @@ class App:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    App(root).mainloop()
+    App(root)
+    root.mainloop()
