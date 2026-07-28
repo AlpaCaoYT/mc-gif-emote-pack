@@ -116,13 +116,14 @@ DEFAULT_CONFIG = {
     "gif_dir": str((TOOL_DIR.parent / "素材")),
     "out_dir": str((TOOL_DIR.parent / "输出")),
     "pack_name": "我的动图资源包",
-    "description": "动态表情包资源包 一键生成",
+    "description": "§6§l动态表情包资源包 §r§7· §e一键生成",
     "mc_version": "1.21.9 - 1.21.10",
     "resolution": 128,
     "scope": "常见方块",
     "alpha_mode": "填白色底",
     "seed": "奶龙",
     "max_frames": 100,
+    "strategy": "全随机",
 }
 
 
@@ -191,11 +192,18 @@ def generate_pack(cfg, log, progress):
     alpha_fill = cfg["alpha_mode"] == "填白色底"
     pack_format = PACK_FORMATS[cfg["mc_version"]]
 
-    gifs = sorted(gif_dir.rglob("*.gif"))
+    gifs = sorted(set(gif_dir.rglob("*.gif")) | set(gif_dir.rglob("*.png")))
     if not gifs:
         raise ValueError(f"素材文件夹里没有 GIF：{gif_dir}")
 
-    data = json.loads(TEXTURE_LIST_FILE.read_text(encoding="utf-8-sig"))
+    # 游戏版本可对应不同方块清单模板；目前内置 1.21.10 一套，其他版本自动回退到它
+    VERSION_TEXTURE_MAP = {
+        "1.21.9 - 1.21.10": "vanilla_textures_1.21.10.json",
+    }
+    list_file = TOOL_DIR / VERSION_TEXTURE_MAP.get(cfg["mc_version"], "vanilla_textures_1.21.10.json")
+    if not list_file.exists():
+        list_file = TEXTURE_LIST_FILE
+    data = json.loads(list_file.read_text(encoding="utf-8-sig"))
     scope = cfg["scope"]
     if scope == "常见方块":
         avail = set(data["block"])
@@ -208,15 +216,24 @@ def generate_pack(cfg, log, progress):
             targets = blocks + [("item", n) for n in data["item"] if not _excluded(n, EXCLUDE_ITEM)]
 
     rng = random.Random(cfg["seed"] or None)
-    rng.shuffle(targets)
-
-    # 目标多于素材时循环使用素材；素材多于目标时随机取一部分素材
     gif_pool = gifs[:]
     rng.shuffle(gif_pool)
-    if len(targets) <= len(gif_pool):
-        mapping = list(zip(targets, gif_pool[:len(targets)]))
+
+    # “优先常见方块用不同表情”：常见方块先各自拿到不同表情，其余格子再循环复用
+    if cfg.get("strategy") == "优先常见方块用不同表情" and scope != "全部方块":
+        common_set = set(COMMON_BLOCKS)
+        is_common = lambda t: t[0] == "block" and t[1] in common_set
+        common_ts = [t for t in targets if is_common(t)]
+        rest_ts = [t for t in targets if not is_common(t)]
+        mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(common_ts)]
+        mapping += [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(rest_ts)]
     else:
-        mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(targets)]
+        # 全随机：目标打乱后依次分配；素材多于目标只用一部分，目标多于素材则循环复用
+        rng.shuffle(targets)
+        if len(targets) <= len(gif_pool):
+            mapping = list(zip(targets, gif_pool[:len(targets)]))
+        else:
+            mapping = [(t, gif_pool[i % len(gif_pool)]) for i, t in enumerate(targets)]
 
     pack_dir = out_dir / pack_name
     if pack_dir.exists():
@@ -354,6 +371,7 @@ class App:
         add_combo("游戏版本", "mc_version", list(PACK_FORMATS.keys()))
         add_combo("贴图分辨率", "resolution", [64, 128, 256])
         add_combo("替换范围", "scope", ["常见方块", "全部方块", "方块+物品"])
+        add_combo("分配策略", "strategy", ["全随机", "优先常见方块用不同表情"])
         add_combo("透明底处理", "alpha_mode", ["填白色底", "保留透明"])
         add_entry("随机种子（相同种子结果一致）", "seed")
         add_entry("单张GIF最大帧数", "max_frames")
