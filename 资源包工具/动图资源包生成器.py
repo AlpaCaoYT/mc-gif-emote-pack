@@ -7,7 +7,6 @@
 
 import csv
 import fnmatch
-import hashlib
 import json
 import os
 import random
@@ -189,6 +188,11 @@ def generate_pack(cfg, log, progress):
     pack_name = cfg["pack_name"].strip() or "动图资源包"
     size = int(cfg["resolution"])
     max_frames = max(2, int(cfg["max_frames"]))
+    # 长图高度 = 宽×帧数，超过游戏贴图上限会导致该贴图不加载，按分辨率自动限制
+    size_limit = max(2, 16384 // size)
+    if max_frames > size_limit:
+        log(f"提示：分辨率 {size} 下长图可能超高，单张最长帧数已自动限制为 {size_limit}")
+        max_frames = size_limit
     alpha_fill = cfg["alpha_mode"] == "填白色底"
     pack_format = PACK_FORMATS[cfg["mc_version"]]
 
